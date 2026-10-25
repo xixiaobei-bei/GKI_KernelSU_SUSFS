@@ -109,11 +109,6 @@ jobs:
           - selinux_mode: stock
           - selinux_mode: lock
 
-    env:
-      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
-      CCACHE_NOHASHDIR: "true"
-      CCACHE_HARDLINK: "true"
-
     steps:
       - name: 构建信息摘要
         run: |
@@ -125,6 +120,7 @@ jobs:
           echo "子版本号      : ${{ inputs.sub_level }}"
           echo "补丁级别      : ${{ inputs.os_patch_level }}"
           echo "KSU 变体      : ${{ inputs.ksu_variant }}"
+          echo "SELinux 模式  : ${{ matrix.selinux_mode }}"
           echo "构建时间      : ${{ inputs.build_time }}"
           echo "SUSFS 状态    : ${{ inputs.enable_susfs }}"
           echo "ZRAM 增强     : ${{ inputs.use_zram }}"
@@ -136,7 +132,7 @@ jobs:
           echo "SUSFS 集成补丁导出: ${{ inputs.export_susfs_patches }}"
           echo "Droidspaces   : ${{ inputs.droidspaces }}"
           echo "NTSync        : ${{ inputs.droidspaces_ntsync }}"
-          echo "产物上传模式  : ${{ inputs.artifact_upload_mode }}"
+          echo "产物上传模式  : 仅打包内核源码（按 SELinux 模式区分）"
           echo "Stock Config  : 自动检测 config/stock_defconfig"
           echo "========================================"
 
@@ -218,12 +214,7 @@ jobs:
           KERNEL_PATCHES=$GITHUB_WORKSPACE/kernel_patches
           SUKISU_PATCHES=$GITHUB_WORKSPACE/SukiSU_patch
           ZZH_PATCHES=$GITHUB_WORKSPACE
-          ANYKERNEL3=$GITHUB_WORKSPACE/AnyKernel3
           ACTION_BUILD=$GITHUB_WORKSPACE/Action-Build
-          AVBTOOL=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/bin/avbtool
-          MKBOOTIMG=$GITHUB_WORKSPACE/mkbootimg/mkbootimg.py
-          UNPACK_BOOTIMG=$GITHUB_WORKSPACE/mkbootimg/unpack_bootimg.py
-          BOOT_SIGN_KEY_PATH=$GITHUB_WORKSPACE/kernel-build-tools/linux-x86/share/avb/testkey_rsa2048.pem
           EOF
 
           mkdir -p "$GITHUB_WORKSPACE/git-repo"
@@ -252,55 +243,7 @@ jobs:
       - name: 安装编译依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y ccache python3 git curl build-essential libssl-dev bison flex libelf-dev dwarves
-
-      - name: 配置 ccache
-        run: |
-          mkdir -p ~/.cache/bazel
-          ccache --version
-          ccache --max-size=2G
-          ccache --set-config=compression=true
-          echo "CCACHE_DIR=$HOME/.ccache" >> $GITHUB_ENV
-
-      - name: 恢复 ccache 缓存
-        uses: actions/cache@v5
-        with:
-          path: ~/.ccache
-          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-${{ github.sha }}
-          restore-keys: |
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-ccache-
-
-      # 仅 6.1+ 走 bazel 构建，持久化 --disk_cache 目录以加速后续构建
-      - name: 恢复 bazel 磁盘缓存
-        if: inputs.android_version != 'android12' && inputs.android_version != 'android13'
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/bazel
-          key: ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-bazel-${{ github.sha }}
-          restore-keys: |
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-${{ inputs.sub_level }}-bazel-
-            ${{ inputs.android_version }}-${{ inputs.kernel_version }}-bazel-
-
-      - name: 缓存工具链
-        id: cache-toolchain
-        uses: actions/cache@v5
-        with:
-          path: |
-            kernel-build-tools
-            mkbootimg
-          key: toolchain-${{ runner.os }}-v1
-
-      - name: 下载工具链
-        if: steps.cache-toolchain.outputs.cache-hit != 'true'
-        run: |
-          AOSP_MIRROR=https://android.googlesource.com
-          BRANCH=main-kernel-build-2024
-          git clone $AOSP_MIRROR/kernel/prebuilts/build-tools -b $BRANCH --depth 1 kernel-build-tools
-          git clone $AOSP_MIRROR/platform/system/tools/mkbootimg -b $BRANCH --depth 1 mkbootimg
-
-      - name: 生成签名密钥
-        run: |
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 > $BOOT_SIGN_KEY_PATH
+          sudo apt-get install -y python3 git curl build-essential libssl-dev bison flex libelf-dev zstd jq
 
       - name: 配置 Git
         run: |
@@ -333,12 +276,6 @@ jobs:
             echo "克隆 $repository 失败，已用尽 5 次尝试（退出码 $rc）" >&2
             return "$rc"
           }
-
-          ANYKERNEL_BRANCH="gki-2.0"
-
-          echo "克隆 AnyKernel3..."
-          clone_with_retry https://github.com/WildKernels/AnyKernel3.git AnyKernel3 -b "$ANYKERNEL_BRANCH"
-          rm -rf AnyKernel3/.git
 
           echo "准备补丁资源..."
           clone_with_retry https://github.com/WildKernels/kernel_patches.git kernel_patches
@@ -1596,223 +1533,7 @@ jobs:
             fi
           fi
 
-      - name: 编译内核
-        id: compile_kernel
-        uses: nick-fields/retry@v4
-        with:
-          shell: bash
-          timeout_minutes: 30
-          max_attempts: 3
-          retry_on: timeout
-          command: |
-            LOG_DIR="$GITHUB_WORKSPACE/build-logs"
-            ATTEMPT_FILE="$LOG_DIR/.compile-attempt"
-            mkdir -p "$LOG_DIR"
-
-            # 为 retry 的每次执行生成独立日志
-            ATTEMPT=1
-            if [ -s "$ATTEMPT_FILE" ]; then
-              read -r LAST_ATTEMPT < "$ATTEMPT_FILE"
-              if [[ "$LAST_ATTEMPT" =~ ^[0-9]+$ ]]; then
-                ATTEMPT=$((LAST_ATTEMPT + 1))
-              fi
-            fi
-            echo "$ATTEMPT" > "$ATTEMPT_FILE"
-            LOG_FILE="$LOG_DIR/compile-attempt-${ATTEMPT}.log"
-
-            set -o pipefail
-            {
-              echo "编译尝试: $ATTEMPT"
-              echo "开始时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-              echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
-              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE:-未启用}"
-              set -ex
-              cd "$KERNEL_ROOT"
-
-              sed -i 's/BUILD_SYSTEM_DLKM=1/BUILD_SYSTEM_DLKM=0/' ./common/build.config.gki.aarch64
-              sed -i '/MODULES_ORDER=android\/gki_aarch64_modules/d' ./common/build.config.gki.aarch64
-              sed -i '/KMI_SYMBOL_LIST_STRICT_MODE/d' ./common/build.config.gki.aarch64
-
-              if [ -f "build/build.sh" ]; then
-                BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh CC="/usr/bin/ccache clang" || exit 1
-                strings "out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist/Image" | grep 'Linux version'
-              else
-                # 提取 gki_defconfig 修改到 fragment，避免 bazel trim 检查失败
-                FRAG="common/arch/arm64/configs/ksu.fragment"
-                diff "$DEFCONFIG.orig" "$DEFCONFIG" | grep '^>' | sed 's/^> //; s/^[[:space:]]*//' > "$FRAG" || true
-                cp "$DEFCONFIG.orig" "$DEFCONFIG"
-                echo "=== KSU Fragment 内容 ==="
-                cat "$FRAG"
-                echo "========================="
-                FRAG_FLAG=""
-                if [ -s "$FRAG" ]; then
-                  FRAG_FLAG="--defconfig_fragment=//common:arch/arm64/configs/ksu.fragment"
-                fi
-                tools/bazel build --disk_cache=/home/runner/.cache/bazel --config=fast $FRAG_FLAG //common:kernel_aarch64/Image || exit 1
-                strings ./bazel-bin/common/kernel_aarch64/Image | grep 'Linux version'
-              fi
-
-              FINAL_CONFIG=$(find ./bazel-bin/common ./out -maxdepth 4 -name '.config' -type f 2>/dev/null | head -n1 || true)
-              if [ -n "$FINAL_CONFIG" ]; then
-                echo "最终配置: $FINAL_CONFIG"
-                grep -E '^CONFIG_LTO' "$FINAL_CONFIG" || echo '（未找到 CONFIG_LTO，可能未启用 LTO 支持）'
-                if grep -qx 'CONFIG_LTO_CLANG_THIN=y' "$FINAL_CONFIG"; then
-                  echo "::error::Image 使用了 Thin LTO，与官方 GKI 的 LTO_NONE 不一致，刷入后可能无法启动"
-                  exit 1
-                fi
-              else
-                echo "::warning::未找到生成的 .config，跳过 LTO 一致性校验"
-              fi
-
-              echo "当前 KSU 最新提交日期: ${KSU_LATEST_COMMIT_DATE}"
-              echo "当前 SUSFS 最新提交日期: ${SUSFS_LATEST_COMMIT_DATE:-未启用}"
-              echo "如果日期不同或相差过远则补丁失效、编译失败"
-            } 2>&1 | tee "$LOG_FILE"
-
-            BUILD_STATUS=${PIPESTATUS[0]}
-            {
-              echo "结束时间: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-              echo "退出码: $BUILD_STATUS"
-            } >> "$LOG_FILE"
-            exit "$BUILD_STATUS"
-
-      - name: 整理编译失败日志
-        if: ${{ always() && steps.compile_kernel.outcome == 'failure' }}
-        env:
-          COMPILE_ATTEMPTS: ${{ steps.compile_kernel.outputs.total_attempts }}
-          COMPILE_EXIT_CODE: ${{ steps.compile_kernel.outputs.exit_code }}
-        run: |
-          LOG_DIR="$GITHUB_WORKSPACE/build-logs"
-          mkdir -p "$LOG_DIR"
-
-          {
-            echo "Android 版本: ${{ inputs.android_version }}"
-            echo "内核版本: ${{ inputs.kernel_version }}.${{ inputs.sub_level }}"
-            echo "安全补丁级别: ${{ inputs.os_patch_level }}"
-            echo "KernelSU 变体: ${{ inputs.ksu_variant }}"
-            echo "配置名称: ${CONFIG:-未知}"
-            echo "Git 提交: $GITHUB_SHA"
-            echo "工作流地址: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "编译尝试次数: ${COMPILE_ATTEMPTS:-未知}"
-            echo "最终退出码: ${COMPILE_EXIT_CODE:-未知}"
-            echo "KSU 提交日期: ${KSU_LATEST_COMMIT_DATE:-未知}"
-            echo "SUSFS 提交日期: ${SUSFS_LATEST_COMMIT_DATE:-未知}"
-          } > "$LOG_DIR/summary.txt"
-
-          printf '%s\n' "${{ inputs.ksu_variant }}_kernel-${CONFIG}-Build-Logs" > "$LOG_DIR/artifact-name.txt"
-
-          df -h "$GITHUB_WORKSPACE" > "$LOG_DIR/disk-usage.txt" 2>&1 || true
-          ccache -s > "$LOG_DIR/ccache-stats.txt" 2>&1 || true
-
-      - name: 上传编译失败日志
-        if: ${{ always() && steps.compile_kernel.outcome == 'failure' }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-Build-Logs
-          path: build-logs/
-          if-no-files-found: warn
-          retention-days: 7
-          compression-level: 9
-
-      # - name: 应用 KPM 补丁 (SukiSU/BakaSU/Next)
-      #   if: startsWith(inputs.use_kpm, 'patched') && (inputs.ksu_variant == 'SukiSU' || inputs.ksu_variant == 'BakaSU' || inputs.ksu_variant == 'Next')
-      #   run: |
-      #     case "${{ inputs.android_version }}" in
-      #       "android12"|"android13")
-      #         if [ "${{ inputs.kernel_version }}" != "6.6" ]; then
-      #           TARGET_PATH="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-      #         fi
-      #         ;;
-      #       "android14"|"android15"|"android16")
-      #         TARGET_PATH="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64/"
-      #         ;;
-      #     esac
-
-      #     cp -r $SUKISU_PATCHES/kpm/patch_linux "$TARGET_PATH/patch"
-      #     cd "$TARGET_PATH"
-      #     chmod 777 patch
-      #     ./patch
-      #     rm -rf Image
-      #     mv oImage Image
-
-      - name: 准备 Boot 镜像
-        run: |
-          mkdir -p bootimgs
-
-          if [ "${{ inputs.android_version }}" == "android12" ] || [ "${{ inputs.android_version }}" == "android13" ]; then
-            SRC_DIR="$KERNEL_ROOT/out/${{ inputs.android_version }}-${{ inputs.kernel_version }}/dist"
-          else
-            SRC_DIR="$KERNEL_ROOT/bazel-bin/common/kernel_aarch64"
-          fi
-
-          cp "$SRC_DIR/Image" ./bootimgs/
-          cp "$SRC_DIR/Image.lz4" ./bootimgs/
-          cp "$SRC_DIR/Image" ./
-          cp "$SRC_DIR/Image.lz4" ./
-          gzip -n -k -f -9 ./Image > ./Image.gz
-
-      - name: 创建 AnyKernel3 压缩包
-        if: inputs.artifact_upload_mode == '上传全部'
-        run: |
-          cd "$ANYKERNEL3"
-          ZIP_NAME="${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-AnyKernel3.zip"
-          mv ../Image ./Image
-          zip -r "../$ZIP_NAME" ./*
-
-      - name: 准备 AnyKernel3 目录
-        if: inputs.artifact_upload_mode != '上传全部'
-        run: |
-          mv ./Image "$ANYKERNEL3/Image"
-
-      - name: 构建 Boot 镜像 (Android 12)
-        if: inputs.android_version == 'android12'
-        working-directory: bootimgs
-        run: |
-          GKI_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-${{ inputs.os_patch_level }}_${{ inputs.revision }}.zip
-          FALLBACK_URL=https://dl.google.com/android/gki/gki-certified-boot-android12-5.10-2023-01_r1.zip
-
-          status=$(curl -sL -w "%{http_code}" "$GKI_URL" -o /dev/null)
-          if [ "$status" = "200" ]; then
-            curl -Lo gki-kernel.zip "$GKI_URL"
-          else
-            curl -Lo gki-kernel.zip "$FALLBACK_URL"
-          fi
-
-          unzip gki-kernel.zip && rm gki-kernel.zip
-          $UNPACK_BOOTIMG --boot_img="$(pwd)/boot-5.10.img"
-
-          gzip -n -k -f -9 ./Image > ./Image.gz
-
-          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot.img
-
-          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot-gz.img
-
-          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img --ramdisk out/ramdisk --os_version 12.0.0 --os_patch_level "${{ inputs.os_patch_level }}"
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot-lz4.img
-
-      - name: 构建 Boot 镜像 (Android 13+)
-        if: inputs.android_version == 'android13' || inputs.android_version == 'android14' || inputs.android_version == 'android15' || inputs.android_version == 'android16'
-        working-directory: bootimgs
-        run: |
-          gzip -n -k -f -9 ./Image > ./Image.gz
-
-          $MKBOOTIMG --header_version 4 --kernel Image --output boot.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot.img
-
-          $MKBOOTIMG --header_version 4 --kernel Image.gz --output boot-gz.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-gz.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot-gz.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot-gz.img
-
-          $MKBOOTIMG --header_version 4 --kernel Image.lz4 --output boot-lz4.img
-          $AVBTOOL add_hash_footer --partition_name boot --partition_size $((64 * 1024 * 1024)) --image boot-lz4.img --algorithm SHA256_RSA2048 --key $BOOT_SIGN_KEY_PATH
-          cp ./boot-lz4.img ../${{ inputs.android_version }}-${{ inputs.kernel_version }}.${{ inputs.sub_level }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}-boot-lz4.img
-
+      # ==================== 收集补丁冲突（在打包前，保留 .repo 以便判断上游自带 .rej） ====================
       - name: 收集补丁冲突文件
         if: always()
         run: |
@@ -1851,39 +1572,78 @@ jobs:
             done
           fi
 
+      # ==================== 打包内核源码 ====================
+      - name: 打包内核源码
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          # 移除 repo 元数据与构建残留，减小压缩包体积
+          rm -rf "$KERNEL_ROOT/.repo" || true
+          find "$KERNEL_ROOT" -maxdepth 1 -type d -name 'out' -exec rm -rf {} + 2>/dev/null || true
+          find "$KERNEL_ROOT" -maxdepth 1 -type d -name 'bazel-*' -exec rm -rf {} + 2>/dev/null || true
+
+          SOURCE_ARCHIVE="${CONFIG}-${{ inputs.ksu_variant }}-${{ matrix.selinux_mode }}-kernel-source.tar.zst"
+
+          echo "正在打包 $KERNEL_ROOT ..."
+          tar \
+            --exclude='.repo' \
+            --exclude='*.tar.zst' \
+            -I 'zstd -T0 -10' \
+            -cf "$SOURCE_ARCHIVE" \
+            "$CONFIG"
+
+          ls -lh "$SOURCE_ARCHIVE"
+          echo "KERNEL_SOURCE_ARCHIVE=$SOURCE_ARCHIVE" >> $GITHUB_ENV
+
+      - name: 生成源码包校验信息
+        run: |
+          {
+            echo "Android 版本   : ${{ inputs.android_version }}"
+            echo "内核版本       : ${{ inputs.kernel_version }}.${{ inputs.sub_level }}"
+            echo "安全补丁级别   : ${{ inputs.os_patch_level }}"
+            echo "KernelSU 变体  : ${{ inputs.ksu_variant }}"
+            echo "SELinux 模式   : ${{ matrix.selinux_mode }}"
+            echo "配置名称       : ${CONFIG}"
+            echo "Git 提交       : $GITHUB_SHA"
+            echo "工作流地址     : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "实际子版本号   : ${ACTUAL_SUBLEVEL:-未知}"
+            echo "KSU 提交日期   : ${KSU_LATEST_COMMIT_DATE:-未知}"
+            echo "SUSFS 提交日期 : ${SUSFS_LATEST_COMMIT_DATE:-未知}"
+            echo "GKI 分支       : ${REMOTE_BRANCH:-未知}"
+            echo "TAG 回退       : ${TAG_FALLBACK:-无}"
+            echo "打包时间       : $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "SHA256         : $(sha256sum "$KERNEL_SOURCE_ARCHIVE" | awk '{print $1}')"
+            echo "大小           : $(du -h "$KERNEL_SOURCE_ARCHIVE" | cut -f1)"
+          } > "${KERNEL_SOURCE_ARCHIVE}.info.txt"
+          cat "${KERNEL_SOURCE_ARCHIVE}.info.txt"
+
+      - name: 上传内核源码包
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-${{ matrix.selinux_mode }}-source
+          path: |
+            ${{ env.KERNEL_SOURCE_ARCHIVE }}
+            ${{ env.KERNEL_SOURCE_ARCHIVE }}.info.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
       # 产物名不带 _kernel- 前缀，避免 release 的「上传内核产物」通配到补丁文件
       - name: 上传 SUSFS 集成补丁
         if: success() && env.SUSFS_PATCH_EXPORT == 'true'
         uses: actions/upload-artifact@v6
         with:
-          name: SUSFS-Patch-${{ inputs.ksu_variant }}-${{ env.CONFIG }}-${{ inputs.os_patch_level }}
+          name: SUSFS-Patch-${{ inputs.ksu_variant }}-${{ env.CONFIG }}-${{ inputs.os_patch_level }}-${{ matrix.selinux_mode }}
           path: susfs-patch/
           if-no-files-found: warn
-          compression-level: 9
-
-      - name: 上传 AnyKernel3 刷入包
-        if: inputs.artifact_upload_mode != '上传全部'
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-AnyKernel3
-          path: AnyKernel3/*
-          compression-level: 9
-
-      - name: 上传全部构建产物
-        if: inputs.artifact_upload_mode == '上传全部'
-        uses: actions/upload-artifact@v6
-        with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}
-          path: |
-            *AnyKernel3.zip
-            *.img
           compression-level: 9
 
       - name: 上传补丁冲突文件
         if: always() && env.REJ_COUNT > 0
         uses: actions/upload-artifact@v6
         with:
-          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-Rejects
+          name: ${{ inputs.ksu_variant }}_kernel-${{ env.CONFIG }}-${{ matrix.selinux_mode }}-Rejects
           path: patch-rejects/
           if-no-files-found: ignore
           compression-level: 9
